@@ -1,0 +1,207 @@
+{
+ "id": "generate-order",
+ "tab": "Flow: place order",
+ "title": "Placing an order",
+ "subtitle": "POST /order/generateOrder \u00b7 mall-portal",
+ "description": "What happens when a shopper checks out their cart: price it, lock stock, write the order, then schedule an auto-cancel.",
+ "nodes": [
+  {
+   "id": "client",
+   "label": "Shopper app",
+   "kind": "client"
+  },
+  {
+   "id": "ctrl",
+   "label": "OmsPortalOrderController",
+   "kind": "controller",
+   "module": "mall-portal",
+   "files": [
+    "mall-portal/src/main/java/com/macro/mall/portal/controller/OmsPortalOrderController.java"
+   ]
+  },
+  {
+   "id": "svc",
+   "label": "OmsPortalOrderService",
+   "kind": "service",
+   "module": "mall-portal",
+   "files": [
+    "mall-portal/src/main/java/com/macro/mall/portal/service/impl/OmsPortalOrderServiceImpl.java"
+   ],
+   "note": "Owns the whole checkout. 700+ lines; most of it is price maths."
+  },
+  {
+   "id": "member",
+   "label": "UmsMemberService",
+   "kind": "service",
+   "module": "mall-portal"
+  },
+  {
+   "id": "cart",
+   "label": "OmsCartItemService",
+   "kind": "service",
+   "module": "mall-portal",
+   "note": "Loads the cart and applies promotions through OmsPromotionService."
+  },
+  {
+   "id": "redis",
+   "label": "Redis",
+   "kind": "cache",
+   "note": "INCR on a per-day key gives the order number its sequence."
+  },
+  {
+   "id": "mapper",
+   "label": "Order mappers",
+   "kind": "repo",
+   "module": "mall-mbg",
+   "note": "MyBatis generated mappers + PortalOrderItemDao"
+  },
+  {
+   "id": "db",
+   "label": "MySQL",
+   "kind": "db"
+  },
+  {
+   "id": "mq",
+   "label": "RabbitMQ",
+   "kind": "queue",
+   "note": "Delayed message: cancels the order if it is still unpaid after the timeout."
+  }
+ ],
+ "steps": [
+  {
+   "from": "client",
+   "to": "ctrl",
+   "label": "POST /order/generateOrder",
+   "payload": {
+    "cartIds": [
+     12,
+     13
+    ],
+    "couponId": 4,
+    "useIntegration": 0,
+    "payType": 1,
+    "memberReceiveAddressId": 7
+   },
+   "code": [
+    "mall-portal/src/main/java/com/macro/mall/portal/controller/OmsPortalOrderController.java:43"
+   ]
+  },
+  {
+   "from": "ctrl",
+   "to": "svc",
+   "label": "generateOrder(orderParam)",
+   "code": [
+    "mall-portal/src/main/java/com/macro/mall/portal/service/impl/OmsPortalOrderServiceImpl.java:94"
+   ]
+  },
+  {
+   "from": "svc",
+   "to": "member",
+   "label": "getCurrentMember()",
+   "detail": "Who is checking out (from the JWT in the security context)."
+  },
+  {
+   "from": "member",
+   "to": "svc",
+   "kind": "return",
+   "label": "UmsMember #31"
+  },
+  {
+   "from": "svc",
+   "to": "cart",
+   "label": "listPromotion(memberId, cartIds)",
+   "code": [
+    "mall-portal/src/main/java/com/macro/mall/portal/service/impl/OmsPortalOrderServiceImpl.java:102"
+   ],
+   "detail": "Loads cart lines and works out each line's promotion price."
+  },
+  {
+   "from": "cart",
+   "to": "svc",
+   "kind": "return",
+   "label": "2 priced cart lines"
+  },
+  {
+   "from": "svc",
+   "to": "svc",
+   "label": "hasStock() \u2192 else throw",
+   "code": [
+    "mall-portal/src/main/java/com/macro/mall/portal/service/impl/OmsPortalOrderServiceImpl.java:124"
+   ],
+   "detail": "If any line has no stock left, the order fails here with 'stock not enough'."
+  },
+  {
+   "from": "svc",
+   "to": "svc",
+   "label": "coupon + points + totals",
+   "code": [
+    "mall-portal/src/main/java/com/macro/mall/portal/service/impl/OmsPortalOrderServiceImpl.java:135"
+   ],
+   "detail": "getUseCoupon, handleCouponAmount, calcTotalAmount, calcPayAmount\u2026"
+  },
+  {
+   "from": "svc",
+   "to": "svc",
+   "label": "lockStock(lines)",
+   "code": [
+    "mall-portal/src/main/java/com/macro/mall/portal/service/impl/OmsPortalOrderServiceImpl.java:165"
+   ],
+   "detail": "Moves quantity into lock_stock so nobody else can buy it."
+  },
+  {
+   "from": "svc",
+   "to": "redis",
+   "label": "INCR order sn",
+   "code": [
+    "mall-portal/src/main/java/com/macro/mall/portal/service/impl/OmsPortalOrderServiceImpl.java:446"
+   ],
+   "detail": "generateOrderSn: date + source + payType + Redis sequence."
+  },
+  {
+   "from": "svc",
+   "to": "mapper",
+   "label": "insert(order)"
+  },
+  {
+   "from": "mapper",
+   "to": "db",
+   "label": "INSERT oms_order",
+   "ms": 8
+  },
+  {
+   "from": "svc",
+   "to": "mapper",
+   "label": "insertList(orderItems)",
+   "code": [
+    "mall-portal/src/main/java/com/macro/mall/portal/service/impl/OmsPortalOrderServiceImpl.java:229"
+   ],
+   "detail": "\u26a0 This is the line in the crash tab: a duplicate order_sn blows up here."
+  },
+  {
+   "from": "mapper",
+   "to": "db",
+   "kind": "slow",
+   "label": "INSERT oms_order_item \u00d72",
+   "ms": 240
+  },
+  {
+   "from": "svc",
+   "to": "mq",
+   "kind": "async",
+   "label": "cancel order in 60 min",
+   "detail": "sendDelayMessageCancelOrder \u2192 RabbitMQ delayed queue."
+  },
+  {
+   "from": "svc",
+   "to": "ctrl",
+   "kind": "return",
+   "label": "{order, orderItemList}"
+  },
+  {
+   "from": "ctrl",
+   "to": "client",
+   "kind": "return",
+   "label": "200 CommonResult.success"
+  }
+ ]
+}
